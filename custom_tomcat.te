@@ -1,0 +1,195 @@
+policy_module(custom_tomcat, 1.0.0)
+
+########################################
+#
+# Declarations
+#
+
+## <desc>
+## <p>
+## Allow tomcat to read rpm database.
+## </p>
+## </desc>
+gen_tunable(tomcat_read_rpm_db, false)
+
+attribute tomcat_domain;
+
+tomcat_domain_template(tomcat)
+
+type tomcat_unit_file_t;
+systemd_unit_file(tomcat_unit_file_t)
+
+########################################
+#
+# tomcat local policy
+#
+
+allow tomcat_t self:capability setgid;
+
+allow tomcat_t self:process execmem;
+allow tomcat_t self:process { signal signull };
+
+allow tomcat_t self:tcp_socket { accept listen };
+
+auth_use_nsswitch(tomcat_t)
+
+# Temporary fix, while missing SELinux policies for HSM
+init_stream_connect_script(tomcat_t)
+
+optional_policy(`
+    pki_manage_tomcat_cert(tomcat_t)
+    pki_manage_apache_log_files(tomcat_t)
+    pki_manage_tomcat_lib(tomcat_t)
+    pki_manage_tomcat_etc_rw(tomcat_t)
+    pki_search_log_dirs(tomcat_t)
+    pki_manage_tomcat_pid(tomcat_t)
+    pki_manage_tomcat_log(tomcat_t)
+    pki_manage_common_files(tomcat_t)
+    pki_exec_common_files(tomcat_t)
+    pki_stream_connect(tomcat_t)
+')
+
+optional_policy(`
+    ipa_read_lib(tomcat_t)
+	ipa_read_tmp(tomcat_t)
+')
+
+########################################
+#
+# tomcat domain policy
+#
+
+allow tomcat_t self:capability { dac_read_search dac_override setuid kill };
+
+allow tomcat_t self:process { execmem setcap setsched signal signull };
+allow tomcat_domain self:fifo_file rw_fifo_file_perms;
+allow tomcat_domain self:unix_stream_socket create_stream_socket_perms;
+
+# we want to stay in a new tomcat domain if we call tomcat binary from a script
+# initrc_t@tomcat_test_exec_t->tomcat_test_t@tomcat_exec_t->tomcat_test_t
+# can_exec(tomcat_domain, tomcat_exec_t)
+
+kernel_read_network_state(tomcat_domain)
+kernel_search_network_sysctl(tomcat_domain)
+kernel_read_net_sysctls(tomcat_domain)
+kernel_read_usermodehelper_state(tomcat_domain)
+
+# corecmd_exec_bin(tomcat_domain)
+# corecmd_exec_shell(tomcat_domain)
+
+corenet_tcp_bind_generic_node(tomcat_domain)
+corenet_udp_bind_generic_node(tomcat_domain)
+corenet_tcp_bind_http_port(tomcat_domain)
+corenet_tcp_bind_http_cache_port(tomcat_domain)
+corenet_tcp_bind_mxi_port(tomcat_domain)
+corenet_tcp_bind_transproxy_port(tomcat_domain)
+corenet_tcp_bind_bctp_port(tomcat_domain)
+corenet_tcp_connect_http_cache_port(tomcat_domain)
+corenet_tcp_connect_http_port(tomcat_domain)
+corenet_tcp_connect_ldap_port(tomcat_domain)
+corenet_tcp_connect_mxi_port(tomcat_domain)
+corenet_tcp_connect_transproxy_port(tomcat_domain)
+corenet_tcp_connect_postgresql_port(tomcat_domain)
+corenet_tcp_connect_amqp_port(tomcat_domain)
+corenet_tcp_connect_oracle_port(tomcat_domain)
+corenet_tcp_connect_ibm_dt_2_port(tomcat_domain)
+corenet_tcp_connect_unreserved_ports(tomcat_domain)
+corenet_tcp_connect_mssql_port(tomcat_domain)
+corenet_tcp_connect_mysqld_port(tomcat_domain)
+corenet_tcp_bind_jboss_management_port(tomcat_domain)
+
+dev_read_rand(tomcat_domain)
+dev_read_urand(tomcat_domain)
+dev_read_sysfs(tomcat_domain)
+
+domain_use_interactive_fds(tomcat_domain)
+
+libs_exec_ldconfig(tomcat_domain)
+
+fs_getattr_all_fs(tomcat_domain)
+fs_read_hugetlbfs_files(tomcat_domain)
+
+sysnet_dns_name_resolve(tomcat_domain)
+
+optional_policy(`
+    cobbler_read_lib_files(tomcat_domain)
+')
+
+optional_policy(`
+	# needed by FreeIPA
+	ldap_stream_connect(tomcat_domain)
+	ldap_read_certs(tomcat_domain)
+')
+
+optional_policy(`
+	tomcat_search_lib(tomcat_domain)
+')
+
+tunable_policy(`tomcat_read_rpm_db',`
+    rpm_exec(tomcat_domain)
+    rpm_read_db(tomcat_domain)
+')
+
+########################################
+#
+# Customization
+#
+
+# we do the following:
+# 1. create a new temporary domain
+# 2. set the transition from init -> our new temporary domain
+# 3. create a type to uniquely label java binaries
+# 4. add a transition from our temporary domain to tomcat_t
+# 5. create a new executable type (so that tomcat_t can execute files with this type if needed)
+# 6. house-keeping such as allowing tomcat_t to send the sigchild signal to our temporary transit domain
+
+# 1. create a new temporary domain
+type tomcat_init_t;
+unconfined_domain(tomcat_init_t)
+
+# 2. set the transition from init -> our new temporary domain
+# we create a new type to be used for entrypoint files (files 
+# like /usr/libexec/tomcat/server) so we can benefit from the default
+# tomcat_domain_template
+type tomcat_initrc_exec_t;
+files_type(tomcat_initrc_exec_t)
+init_daemon_domain(tomcat_init_t, tomcat_initrc_exec_t)
+
+# 3. uniquely label java binaries
+# /usr/lib/jvm/java(.*/)bin(/.*)        system_u:object_r:java_bin_t:s0
+type java_bin_t;
+files_type(java_bin_t)
+
+# 4. perform a domain transition when our temporary domain executes a java binary
+# tomcat_init_t is unconfined so it can run it but we add a domain transition
+domain_auto_trans(tomcat_init_t, java_bin_t, tomcat_t)
+
+# allow java_bin_t to be used as an entrypoint
+allow tomcat_t java_bin_t:file entrypoint;
+
+# allow tomcat to execute java_bin_t labelled files
+can_exec(tomcat_init_t, java_bin_t)
+
+# 5. create a new executable type (so that tomcat_t can execute files with this type if needed)
+# tomcat_exec_bin_t
+# we define this type so that tomcat_t can execute executables if needed
+type tomcat_exec_bin_t;
+files_type(tomcat_exec_bin_t)
+can_exec(tomcat_t, tomcat_exec_bin_t)
+
+# 6. some house-keeping
+
+require {
+	class process sigchld;
+	class file read;
+}
+
+#============= tomcat_t ==============
+allow tomcat_t tomcat_init_t:process sigchld;
+allow tomcat_t tomcat_init_t:fifo_file write;
+allow tomcat_t java_bin_t:file read_file_perms;
+
+# files_manage_usr_files(tomcat_t)
+# fs_search_cgroup_dirs(tomcat_t)
+# fs_read_cgroup_files(tomcat_t)
+# mta_mailserver_delivery(tomcat_t)
